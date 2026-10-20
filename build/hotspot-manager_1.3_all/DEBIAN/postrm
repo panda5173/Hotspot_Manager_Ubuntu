@@ -1,0 +1,3 @@
+#!/bin/sh
+[ "$1" = purge ] && rm -rf /etc/hotspot-manager /var/lib/hotspot-manager
+systemctl daemon-reload 2>/dev/null || true

@@ -1,0 +1,9 @@
+# Hotspot Manager: allow administrators to control the hotspot without a password prompt.
+# Only these exact helper commands are permitted.
+Cmnd_Alias HOTSPOT_MANAGER = /usr/lib/hotspot-manager/hsctl start, \
+                             /usr/lib/hotspot-manager/hsctl stop, \
+                             /usr/lib/hotspot-manager/hsctl restart, \
+                             /usr/lib/hotspot-manager/hsctl get-config, \
+                             /usr/lib/hotspot-manager/hsctl set-config, \
+                             /usr/lib/hotspot-manager/hsctl reset-usage
+%sudo ALL=(root) NOPASSWD: HOTSPOT_MANAGER
