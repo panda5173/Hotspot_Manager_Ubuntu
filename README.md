@@ -17,7 +17,14 @@ CLI:  hotspot-manager --on | --off | --toggle | --restart [--no-wait]
 Files: config /etc/hotspot-manager/config.json (root, 0600) · usage /var/lib/hotspot-manager/usage.json
        nicknames + app prefs ~/.config/hotspot-manager/prefs.json · live status + log /run/hotspot-manager/
 Debug: journalctl -u hotspot-manager -f   ·   cat /run/hotspot-manager/hotspot.log
+
 <img width="775" height="738" alt="image" src="https://github.com/user-attachments/assets/0ec22bad-13ab-4a9f-a6e1-0731d33746c4" />
+
 <img width="775" height="738" alt="image" src="https://github.com/user-attachments/assets/c14d85f8-968a-45e8-89d3-c46fbfa03827" />
+
 <img width="771" height="646" alt="image" src="https://github.com/user-attachments/assets/61fae2b1-8f4f-41f0-9239-b631607a99a6" />
+
+<img width="335" height="353" alt="image" src="https://github.com/user-attachments/assets/165351ad-10a2-4c56-8f30-28650ca69c39" />
+
+<img width="253" height="305" alt="image" src="https://github.com/user-attachments/assets/abc90935-6811-4e23-9061-3bb7b3269137" />
 
