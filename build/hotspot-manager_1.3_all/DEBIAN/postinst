@@ -1,7 +1,0 @@
-#!/bin/sh
-set -e
-mkdir -p /etc/hotspot-manager /var/lib/hotspot-manager
-chmod 440 /etc/sudoers.d/hotspot-manager
-systemctl daemon-reload || true
-gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
-command -v create_ap >/dev/null || echo "WARNING: create_ap not found - install linux-wifi-hotspot."
