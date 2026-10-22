@@ -13,10 +13,23 @@ echo "==> Stopping running hotspot"
 systemctl stop hotspot-manager.service 2>/dev/null || true
 pkill -f 'wihotspot' 2>/dev/null || true
 
+echo "==> Disabling conflicting boot-time hotspot services"
+for u in create_ap.service wihotspot.service; do
+  if systemctl list-unit-files "$u" --no-legend 2>/dev/null | grep -q .; then
+    systemctl stop "$u" 2>/dev/null || true
+    systemctl disable "$u" 2>/dev/null || true
+    systemctl mask "$u" 2>/dev/null || true
+    echo "    masked $u"
+  fi
+done
+systemctl list-units --all --plain --no-legend 'create_ap@*' 2>/dev/null | awk '{print $1}' | \
+  xargs -r -I{} sh -c 'systemctl stop {}; systemctl disable {}' 2>/dev/null || true
+
 echo "==> Installing files"
 install -Dm755 src/hsctl                 /usr/lib/hotspot-manager/hsctl
 install -Dm755 src/hotspot-manager       /usr/bin/hotspot-manager
-install -Dm644 data/hotspot-manager.service /etc/systemd/system/hotspot-manager.service
+install -Dm644 data/hotspot-manager.service      /etc/systemd/system/hotspot-manager.service
+install -Dm644 data/hotspot-manager-boot.service /etc/systemd/system/hotspot-manager-boot.service
 install -Dm644 data/hotspot-manager.desktop /usr/share/applications/hotspot-manager.desktop
 for i in hotspot-manager hotspot-manager-on hotspot-manager-off; do
   install -Dm644 "data/$i.svg" "/usr/share/icons/hicolor/scalable/apps/$i.svg"
@@ -29,6 +42,9 @@ else echo "ERROR: sudoers rule failed validation"; rm -f "$tmp"; exit 1; fi
 rm -f "$tmp"
 
 systemctl daemon-reload
+systemctl disable hotspot-manager.service 2>/dev/null || true     # on-demand only, never at boot
+systemctl enable hotspot-manager-boot.service >/dev/null 2>&1
+/usr/bin/python3 /usr/lib/hotspot-manager/hsctl boot || true      # clean up right now as well
 gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
 update-desktop-database -q 2>/dev/null || true
 pkill -f '/usr/bin/hotspot-manager' 2>/dev/null || true

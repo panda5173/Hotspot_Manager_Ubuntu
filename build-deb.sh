@@ -2,11 +2,12 @@
 # Build hotspot-manager_<ver>_all.deb
 set -euo pipefail
 cd "$(dirname "$0")"
-VER=1.3; P=build/hotspot-manager_${VER}_all
+VER=1.4; P=build/hotspot-manager_${VER}_all
 rm -rf build; mkdir -p "$P/DEBIAN"
 install -Dm755 src/hsctl "$P/usr/lib/hotspot-manager/hsctl"
 install -Dm755 src/hotspot-manager "$P/usr/bin/hotspot-manager"
 install -Dm644 data/hotspot-manager.service "$P/lib/systemd/system/hotspot-manager.service"
+install -Dm644 data/hotspot-manager-boot.service "$P/lib/systemd/system/hotspot-manager-boot.service"
 install -Dm644 data/hotspot-manager.desktop "$P/usr/share/applications/hotspot-manager.desktop"
 install -Dm440 data/hotspot-manager.sudoers "$P/etc/sudoers.d/hotspot-manager"
 for i in hotspot-manager hotspot-manager-on hotspot-manager-off; do
@@ -32,12 +33,22 @@ set -e
 mkdir -p /etc/hotspot-manager /var/lib/hotspot-manager
 chmod 440 /etc/sudoers.d/hotspot-manager
 systemctl daemon-reload || true
+for u in create_ap.service wihotspot.service; do
+  if systemctl list-unit-files "$u" --no-legend 2>/dev/null | grep -q .; then
+    systemctl stop "$u" 2>/dev/null || true; systemctl disable "$u" 2>/dev/null || true
+    systemctl mask "$u" 2>/dev/null || true
+  fi
+done
+systemctl disable hotspot-manager.service 2>/dev/null || true
+systemctl enable hotspot-manager-boot.service >/dev/null 2>&1 || true
+/usr/bin/python3 /usr/lib/hotspot-manager/hsctl boot || true
 gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
 command -v create_ap >/dev/null || echo "WARNING: create_ap not found - install linux-wifi-hotspot."
 PI
 cat > "$P/DEBIAN/prerm" <<'PR'
 #!/bin/sh
 systemctl stop hotspot-manager.service 2>/dev/null || true
+systemctl disable hotspot-manager-boot.service 2>/dev/null || true
 PR
 cat > "$P/DEBIAN/postrm" <<'PO'
 #!/bin/sh

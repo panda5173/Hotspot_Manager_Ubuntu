@@ -3,6 +3,7 @@ Description=Hotspot Manager (create_ap supervisor)
 After=network.target NetworkManager.service
 Wants=network.target
 
+# Started only on demand by the app/CLI. Never enabled at boot.
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /usr/lib/hotspot-manager/hsctl run

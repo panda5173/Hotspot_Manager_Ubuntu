@@ -6,7 +6,8 @@ Runs as root (via a restricted sudoers rule or pkexec). The GUI never runs as ro
   get-config | set-config       read / write /etc/hotspot-manager/config.json (root-only, 0600)
   reset-usage                   clear the usage history
   run                           service entry point: supervises create_ap, tracks usage
-  cleanup                       ExecStopPost: remove firewall/shaping, mark status stopped
+  cleanup                       ExecStopPost: remove firewall/shaping, give Wi-Fi back to NetworkManager
+  boot                          boot guard: undo anything a hard power-off / crash left behind
 """
 import datetime, glob, ipaddress, json, os, re, shutil, signal, socket, subprocess, sys, threading, time
 
@@ -18,6 +19,8 @@ RUN = "/run/hotspot-manager"
 STATUS = RUN + "/status.json"
 LOG = RUN + "/hotspot.log"
 SERVICE = "hotspot-manager.service"
+FOREIGN_UNITS = ("create_ap.service", "create_ap@.service", "wihotspot.service")
+NM_CONFS = ["/etc/NetworkManager/NetworkManager.conf"] + glob.glob("/etc/NetworkManager/conf.d/*.conf")
 IFB = "hsm-ifb0"
 LOG_MAX = 512 * 1024
 TICK = 2
@@ -177,7 +180,7 @@ def sta_link(iface):
 
 
 def nm_state(iface):
-    """NetworkManager device state number (30 disconnected, 40-90 connecting, 100 connected)."""
+    """NetworkManager device state number (10 unmanaged, 30 disconnected, 40-90 connecting, 100 connected)."""
     out = sh(["nmcli", "-g", "GENERAL.STATE", "device", "show", iface], timeout=3).strip()
     m = re.match(r"(\d+)", out)
     return int(m.group(1)) if m else 0
@@ -190,6 +193,14 @@ def nm_reconnect(iface):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+def nm_give_back(iface):
+    """Make sure NetworkManager manages the main Wi-Fi again (create_ap can leave it unmanaged)."""
+    if iface and IFACE_RE.match(iface):
+        run_q(["nmcli", "radio", "wifi", "on"], timeout=5)
+        run_q(["nmcli", "device", "set", iface, "managed", "yes"], timeout=5)
+        run_q(["nmcli", "device", "set", iface, "autoconnect", "yes"], timeout=5)
 
 
 def internet_ok():
@@ -288,6 +299,83 @@ def error_hint(text):
     return err
 
 
+# ---------------------------------------------------------------- foreign hotspot services / boot guard
+def neutralise_foreign_units(log=None):
+    """linux-wifi-hotspot ships create_ap.service. If it is enabled it starts a hotspot at boot
+    (outside Hotspot Manager) and locks the radio, so normal Wi-Fi cannot connect. Stop + mask it.
+    Hotspot Manager runs the create_ap *binary* itself, so masking the unit is safe."""
+    done = []
+    for u in FOREIGN_UNITS:
+        if u.endswith("@.service"):
+            for line in sh(["systemctl", "list-units", "--all", "--plain", "--no-legend", "create_ap@*"]).splitlines():
+                inst = line.split()[0] if line.split() else ""
+                if inst.startswith("create_ap@"):
+                    run_q(["systemctl", "stop", inst], timeout=20)
+                    run_q(["systemctl", "disable", inst], timeout=10)
+                    done.append(inst)
+            continue
+        en = sh(["systemctl", "is-enabled", u]).strip()
+        act = sh(["systemctl", "is-active", u]).strip()
+        if en in ("not-found", "", "masked") and act != "active":
+            continue
+        run_q(["systemctl", "stop", u], timeout=20)
+        run_q(["systemctl", "disable", u], timeout=10)
+        run_q(["systemctl", "mask", u], timeout=10)
+        done.append(u)
+    if done and log:
+        log("Disabled conflicting autostart service(s): " + ", ".join(done))
+    return done
+
+
+def strip_stale_unmanaged():
+    """Old create_ap versions write 'unmanaged-devices=...interface-name:ap0' into NetworkManager.conf
+    and only remove it on a clean exit. Remove leftover ap*/hsm entries after a crash or power-off."""
+    changed = False
+    for path in NM_CONFS:
+        try:
+            lines = open(path).read().splitlines(True)
+        except OSError:
+            continue
+        out, file_changed = [], False
+        for ln in lines:
+            if ln.strip().startswith("unmanaged-devices="):
+                key, _, val = ln.partition("=")
+                items = [i for i in val.strip().split(";") if i]
+                keep = [i for i in items if not re.fullmatch(r"interface-name:(ap\d+|hsm-\S+)", i.strip())]
+                if keep != items:
+                    changed = file_changed = True
+                    if not keep:
+                        continue
+                    ln = f"{key}={';'.join(keep)}\n"
+            out.append(ln)
+        if file_changed:
+            tmp = path + ".hsm-tmp"
+            with open(tmp, "w") as f:
+                f.writelines(out)
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+            os.replace(tmp, path)
+    return changed
+
+
+def boot_guard():
+    """Run at every boot (hotspot-manager-boot.service, before NetworkManager is relied upon)."""
+    os.makedirs(RUN, exist_ok=True)
+    os.chmod(RUN, 0o755)
+    neutralise_foreign_units()
+    for ap in ap_ifaces():
+        run_q(["iw", "dev", ap, "del"])
+    for d in glob.glob("/tmp/create_ap.*"):
+        shutil.rmtree(d, ignore_errors=True)
+    fw_cleanup()
+    shaping_cleanup()
+    nm_changed = strip_stale_unmanaged()
+    write_json(STATUS, {"state": "stopped", "updated": time.time()}, 0o644)
+    cfg = load_conf()
+    if nm_changed:
+        run_q(["nmcli", "general", "reload"], timeout=10)
+    nm_give_back(cfg.get("wifi_iface") or "")
+
+
 # ---------------------------------------------------------------- firewall / shaping
 def ipt(*a):
     return run_q(["iptables", "-w", *a])
@@ -352,7 +440,7 @@ class Controls:
     def __init__(self, ap, note):
         self.ap, self.note = ap, note
         self.denied, self.overflow, self.order = set(), set(), []
-        self.unknown = {}                   # allow-list rejects: mac -> last seen
+        self.unknown = {}
         self.tc_sig = None
         self.ifb = False
         self.warnings = []
@@ -562,6 +650,8 @@ def run():
     def note(msg):
         log.write(f"[{time.strftime('%H:%M:%S')}] [manager] {msg}\n")
 
+    neutralise_foreign_units(note)             # never run alongside create_ap.service
+
     flags = {"stop": False, "rechannel": False, "pause": None}
     signal.signal(signal.SIGTERM, lambda *a: flags.__setitem__("stop", True))
     signal.signal(signal.SIGINT, lambda *a: flags.__setitem__("stop", True))
@@ -586,7 +676,7 @@ def run():
         args.append("--hidden")
     if cfg["isolate"]:
         args.append("--isolate-clients")
-    args += [wifi, inet]                      # same iface -> create_ap uses a virtual AP (ap0)
+    args += [wifi, inet]                       # same iface -> create_ap uses a virtual AP (ap0)
     note("Main Wi-Fi: " + (f"{sta['ssid']} (channel {sta['channel']})" if sta["connected"]
                            else "not connected (hotspot-only mode, no internet)"))
     note("Starting: " + " ".join(args))
@@ -599,7 +689,6 @@ def run():
     except BrokenPipeError:
         pass
 
-    # internet checker thread
     inet_state = {"ok": None, "stop": False}
 
     def inet_loop():
@@ -715,13 +804,13 @@ def run():
                 note("Wi-Fi connection requested: pausing hotspot so Wi-Fi can connect.")
                 flags["pause"] = "connect"
                 break
-            elif ap and standalone and now - t_probe >= (PROBE_BUSY if cl else PROBE_IDLE):
+            elif ap and (standalone or not sta_seen) and now - t_probe >= (PROBE_BUSY if cl else PROBE_IDLE):
                 note("Hotspot-only: briefly pausing to look for main Wi-Fi.")
                 flags["pause"] = "connect"
                 probe = True
                 break
         if up_since and retry and now - up_since > 120:
-            retry = 0                          # stable again: reset crash counter
+            retry = 0
         put()
         if now - t_save >= 30:
             usage.save()
@@ -758,7 +847,7 @@ def run():
         restart_self()
 
     if flags["pause"] and not flags["stop"]:
-        # ---- paused: radio is free, let NetworkManager (re)connect, then resume on its channel
+        nm_give_back(wifi)
         fb = cfg["fallback_min"]
         if probe:
             status.update(state="paused", error="", reason="Checking whether main Wi-Fi is back…")
@@ -777,7 +866,7 @@ def run():
             put()
             if sta["connected"]:
                 note(f"Main Wi-Fi connected to {sta['ssid']} (channel {sta['channel']}); resuming hotspot.")
-                time.sleep(3)                  # let DHCP finish
+                time.sleep(3)
                 log.close()
                 restart_self()
             el = time.time() - t0
@@ -791,7 +880,7 @@ def run():
                 log.close()
                 restart_self(HSM_MODE="standalone")
             if flags["pause"] == "lost" and int(el) % 60 < 2 and el > 5:
-                nm_reconnect(wifi)             # keep nudging NM in case its autoconnect gave up
+                nm_reconnect(wifi)
             time.sleep(2)
 
     rc = 0
@@ -807,7 +896,6 @@ def run():
         except OSError:
             tail = ""
         note(f"create_ap exited with code {proc.returncode}.")
-        # 1) channel problem + preferred 2.4 GHz network configured -> switch and retry once
         if channel_problem(tail) and cfg["pref_net"] and not switched:
             note(f"Switching main Wi-Fi to preferred network '{cfg['pref_net']}'.")
             status.update(state="starting", reason=f"Switching main Wi-Fi to {cfg['pref_net']}…")
@@ -818,7 +906,6 @@ def run():
                 time.sleep(2)
                 restart_self(HSM_SWITCHED="1")
             note("Could not switch network: " + (r.stderr.strip() or "timeout"))
-        # 2) auto-recover with back-off
         if retry < MAX_RETRY and not flags["stop"]:
             wait = 5 * 2 ** retry
             note(f"Auto-recover: restarting in {wait}s (attempt {retry + 1}/{MAX_RETRY}).")
@@ -836,6 +923,7 @@ def run():
         else:
             status.update(state="error", reason="", error=error_hint(tail))
             rc = 1
+    nm_give_back(wifi)
     put()
     log.close()
     try:
@@ -874,7 +962,7 @@ def main():
             write_json(STATUS, {"state": "starting", "updated": time.time()}, 0o644)
         if cmd == "start":
             try:
-                open(LOG, "w").close()         # fresh log per manual start
+                open(LOG, "w").close()
             except OSError:
                 pass
         sys.exit(systemctl(cmd, "--no-block", SERVICE))
@@ -903,6 +991,9 @@ def main():
             st.update(state="stopped", clients=[], ap_iface="", updated=time.time())
             os.makedirs(RUN, exist_ok=True)
             write_json(STATUS, st, 0o644)
+        nm_give_back(load_conf().get("wifi_iface") or "")
+    elif cmd == "boot":
+        boot_guard()
     else:
         die(__doc__, 64)
 
