@@ -1,0 +1,1002 @@
+#!/usr/bin/python3
+"""hsctl - privileged helper for Hotspot Manager.
+
+Runs as root (via a restricted sudoers rule or pkexec). The GUI never runs as root.
+  start | stop | restart        control hotspot-manager.service
+  get-config | set-config       read / write /etc/hotspot-manager/config.json (root-only, 0600)
+  reset-usage                   clear the usage history
+  run                           service entry point: supervises create_ap, tracks usage
+  cleanup                       ExecStopPost: remove firewall/shaping, give Wi-Fi back to NetworkManager
+  boot                          boot guard: undo anything a hard power-off / crash left behind
+"""
+import datetime, glob, ipaddress, json, os, re, shutil, signal, socket, subprocess, sys, threading, time
+
+ETC = "/etc/hotspot-manager"
+CONF = ETC + "/config.json"
+VAR = "/var/lib/hotspot-manager"
+USAGE = VAR + "/usage.json"
+RUN = "/run/hotspot-manager"
+STATUS = RUN + "/status.json"
+LOG = RUN + "/hotspot.log"
+SERVICE = "hotspot-manager.service"
+FOREIGN_UNITS = ("create_ap.service", "create_ap@.service", "wihotspot.service")
+NM_CONFS = ["/etc/NetworkManager/NetworkManager.conf"] + glob.glob("/etc/NetworkManager/conf.d/*.conf")
+IFB = "hsm-ifb0"
+LOG_MAX = 512 * 1024
+TICK = 2
+STA_CHECK = 3            # seconds between main Wi-Fi checks
+STA_LOST_GRACE = 6       # main Wi-Fi must be gone this long before the hotspot pauses
+STANDALONE_WAIT = 60     # NM connect attempt: resume hotspot after this long if Wi-Fi didn't connect
+PROBE_IDLE = 5 * 60      # hotspot-only mode: look for main Wi-Fi every 5 min (no devices)
+PROBE_BUSY = 15 * 60     #                    ... or every 15 min (devices connected)
+PROBE_WAIT = 25          # how long a probe waits for Wi-Fi
+INET_CHECK = 15          # seconds between internet checks
+MAX_RETRY = 3            # auto-recover attempts after a crash
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+DOMAIN_RE = re.compile(r"^(?=.{3,253}$)([a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
+DEFAULTS = {"ssid": "", "password": "", "wifi_iface": "", "inet_iface": "",
+            "band": "auto", "hidden": False, "isolate": False,
+            # live settings (applied without restarting the hotspot)
+            "max_clients": 0, "idle_off": 0, "dl_total": 0, "dl_per": 0, "ul_total": 0, "ul_per": 0,
+            "blocked": [], "blocklist": [], "allow_mode": False, "allowed": [],
+            "fallback_min": 0, "pref_net": ""}
+LIVE_KEYS = ("max_clients", "idle_off", "dl_total", "dl_per", "ul_total", "ul_per", "blocked", "blocklist",
+             "allow_mode", "allowed", "fallback_min", "pref_net")
+FW_KEYS = ("blocked", "blocklist", "allow_mode", "allowed")
+IDLE_CHOICES = (0, 5, 10, 15, 30, 60)
+FALLBACK_CHOICES = (0, 2, 5, 10, 15, 30)
+
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+os.environ["LC_ALL"] = "C"
+
+
+# ---------------------------------------------------------------- utilities
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def run_q(cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path, data, mode):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def load_conf():
+    c = dict(DEFAULTS)
+    raw = read_json(CONF, {})
+    if isinstance(raw, dict):
+        c.update({k: v for k, v in raw.items() if k in DEFAULTS})
+    return c
+
+
+def is_net(e):
+    try:
+        ipaddress.IPv4Network(e, strict=False)
+        return "/" in e or e.count(".") == 3
+    except ValueError:
+        return False
+
+
+def check_mac_list(lst, what):
+    if not isinstance(lst, list) or len(lst) > 256:
+        raise ValueError(f"Invalid {what} list.")
+    for b in lst:
+        if not isinstance(b, dict) or not MAC_RE.match(str(b.get("mac", ""))) or \
+                not isinstance(b.get("name", ""), str) or len(b.get("name", "")) > 64:
+            raise ValueError(f"Invalid MAC address in {what} list: {b}")
+
+
+def validate(c):
+    ssid, pw = c["ssid"], c["password"]
+    if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32 or any(ch in ssid for ch in "\r\n"):
+        raise ValueError("SSID must be 1-32 characters.")
+    if not isinstance(pw, str) or not 8 <= len(pw) <= 63 or not all(32 <= ord(ch) <= 126 for ch in pw):
+        raise ValueError("Password must be 8-63 printable ASCII characters.")
+    if not isinstance(c["wifi_iface"], str) or not IFACE_RE.match(c["wifi_iface"]):
+        raise ValueError("Select a Wi-Fi interface.")
+    if c["inet_iface"] and (not isinstance(c["inet_iface"], str) or not IFACE_RE.match(c["inet_iface"])):
+        raise ValueError("Invalid Internet interface.")
+    if c["band"] not in ("auto", "2.4", "5"):
+        raise ValueError("Invalid band.")
+    for k in ("hidden", "isolate", "allow_mode"):
+        if not isinstance(c[k], bool):
+            raise ValueError(f"Invalid value for {k}.")
+    if not isinstance(c["max_clients"], int) or not 0 <= c["max_clients"] <= 64:
+        raise ValueError("Max devices must be 0-64.")
+    if c["idle_off"] not in IDLE_CHOICES:
+        raise ValueError("Invalid auto-off time.")
+    if c["fallback_min"] not in FALLBACK_CHOICES:
+        raise ValueError("Invalid fallback time.")
+    for k in ("dl_total", "dl_per", "ul_total", "ul_per"):
+        if not isinstance(c[k], (int, float)) or not 0 <= c[k] <= 1000:
+            raise ValueError("Speed limit must be 0-1000 Mbps.")
+    check_mac_list(c["blocked"], "blocked")
+    check_mac_list(c["allowed"], "allowed")
+    if not isinstance(c["blocklist"], list) or len(c["blocklist"]) > 500:
+        raise ValueError("Blocklist allows up to 500 entries.")
+    for e in c["blocklist"]:
+        if not isinstance(e, str) or not (DOMAIN_RE.match(e) or is_net(e)):
+            raise ValueError(f"Invalid website/IP entry: {e}")
+    p = c["pref_net"]
+    if not isinstance(p, str) or len(p) > 64 or any(ord(ch) < 32 for ch in p) or p.startswith("-"):
+        raise ValueError("Invalid preferred network name.")
+
+
+def freq_to_channel(f):
+    f = int(float(f))
+    if f == 2484:
+        return 14
+    if 2412 <= f <= 2472:
+        return (f - 2407) // 5
+    if 5000 <= f <= 5900:
+        return (f - 5000) // 5
+    return None
+
+
+def sta_link(iface):
+    """Main Wi-Fi connection on the physical interface."""
+    out = sh(["iw", "dev", iface, "link"])
+    info = {"connected": False, "ssid": "", "channel": None, "freq": None}
+    if out.startswith("Connected"):
+        info["connected"] = True
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("SSID:"):
+                info["ssid"] = s[5:].strip()
+            elif s.startswith("freq:"):
+                try:
+                    info["freq"] = int(float(s[5:].strip()))
+                    info["channel"] = freq_to_channel(info["freq"])
+                except ValueError:
+                    pass
+    return info
+
+
+def nm_state(iface):
+    """NetworkManager device state number (10 unmanaged, 30 disconnected, 40-90 connecting, 100 connected)."""
+    out = sh(["nmcli", "-g", "GENERAL.STATE", "device", "show", iface], timeout=3).strip()
+    m = re.match(r"(\d+)", out)
+    return int(m.group(1)) if m else 0
+
+
+def nm_reconnect(iface):
+    """Nudge NetworkManager to reconnect the main Wi-Fi (clears its autoconnect back-off)."""
+    try:
+        subprocess.Popen(["nmcli", "device", "connect", iface],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def nm_give_back(iface):
+    """Make sure NetworkManager manages the main Wi-Fi again (create_ap can leave it unmanaged)."""
+    if iface and IFACE_RE.match(iface):
+        run_q(["nmcli", "radio", "wifi", "on"], timeout=5)
+        run_q(["nmcli", "device", "set", iface, "managed", "yes"], timeout=5)
+        run_q(["nmcli", "device", "set", iface, "autoconnect", "yes"], timeout=5)
+
+
+def internet_ok():
+    for host in (("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)):
+        try:
+            socket.create_connection(host, timeout=3).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def wait_sta(iface, secs, stop):
+    t0 = time.time()
+    while time.time() - t0 < secs and not stop():
+        s = sta_link(iface)
+        if s["connected"]:
+            return s
+        time.sleep(2)
+    return None
+
+
+def ap_ifaces():
+    res, cur = [], None
+    for line in sh(["iw", "dev"]).splitlines():
+        s = line.strip()
+        if s.startswith("Interface "):
+            cur = s.split()[1]
+        elif s == "type AP" and cur:
+            res.append(cur)
+    return res
+
+
+def counters(iface):
+    try:
+        base = f"/sys/class/net/{iface}/statistics/"
+        with open(base + "rx_bytes") as a, open(base + "tx_bytes") as b:
+            return int(a.read()), int(b.read())
+    except (OSError, ValueError):
+        return None
+
+
+def clients(ap):
+    sta, cur = {}, None
+    for l in sh(["iw", "dev", ap, "station", "dump"]).splitlines():
+        if l.startswith("Station "):
+            cur = l.split()[1].lower()
+            sta[cur] = {"rx": 0, "tx": 0, "secs": 0}
+        elif cur:
+            k, _, v = l.strip().partition(":")
+            v = v.strip().split(" ")[0]
+            if v.isdigit():
+                if k == "rx bytes":
+                    sta[cur]["rx"] = int(v)
+                elif k == "tx bytes":
+                    sta[cur]["tx"] = int(v)
+                elif k == "connected time":
+                    sta[cur]["secs"] = int(v)
+    if not sta:
+        return []
+    leases = {}
+    for lf in glob.glob("/tmp/create_ap.*/dnsmasq.leases"):
+        try:
+            for l in open(lf):
+                p = l.split()
+                if len(p) >= 4:
+                    leases[p[1].lower()] = (p[2], "" if p[3] == "*" else p[3])
+        except OSError:
+            pass
+    neigh = {}
+    for l in sh(["ip", "-4", "neigh", "show", "dev", ap]).splitlines():
+        p = l.split()
+        if "lladdr" in p:
+            neigh[p[p.index("lladdr") + 1].lower()] = p[0]
+    out = []
+    for m in sta:
+        ip, name = leases.get(m, (neigh.get(m, ""), ""))
+        out.append({"mac": m, "ip": ip or neigh.get(m, ""), "name": name, **sta[m]})
+    return out
+
+
+def channel_problem(text):
+    low = text.lower()
+    return any(k in low for k in ("transmit", "no-ir", "not allowed", "could not set channel"))
+
+
+def error_hint(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip() and "[manager]" not in l]
+    err = next((l for l in reversed(lines) if "ERROR" in l.upper()), lines[-1] if lines else "create_ap exited.")
+    low = text.lower()
+    if channel_problem(text):
+        err += ("\nTip: this adapter cannot host an AP on the main Wi-Fi's current channel. "
+                "Set a 'Fallback 2.4 GHz network' in Settings, or connect to a 2.4 GHz network and retry.")
+    elif "already" in low and "running" in low:
+        err += "\nTip: another hotspot tool (e.g. Wi Hotspot) is using this interface. Stop it first."
+    return err
+
+
+# ---------------------------------------------------------------- foreign hotspot services / boot guard
+def neutralise_foreign_units(log=None):
+    """linux-wifi-hotspot ships create_ap.service. If it is enabled it starts a hotspot at boot
+    (outside Hotspot Manager) and locks the radio, so normal Wi-Fi cannot connect. Stop + mask it.
+    Hotspot Manager runs the create_ap *binary* itself, so masking the unit is safe."""
+    done = []
+    for u in FOREIGN_UNITS:
+        if u.endswith("@.service"):
+            for line in sh(["systemctl", "list-units", "--all", "--plain", "--no-legend", "create_ap@*"]).splitlines():
+                inst = line.split()[0] if line.split() else ""
+                if inst.startswith("create_ap@"):
+                    run_q(["systemctl", "stop", inst], timeout=20)
+                    run_q(["systemctl", "disable", inst], timeout=10)
+                    done.append(inst)
+            continue
+        en = sh(["systemctl", "is-enabled", u]).strip()
+        act = sh(["systemctl", "is-active", u]).strip()
+        if en in ("not-found", "", "masked") and act != "active":
+            continue
+        run_q(["systemctl", "stop", u], timeout=20)
+        run_q(["systemctl", "disable", u], timeout=10)
+        run_q(["systemctl", "mask", u], timeout=10)
+        done.append(u)
+    if done and log:
+        log("Disabled conflicting autostart service(s): " + ", ".join(done))
+    return done
+
+
+def strip_stale_unmanaged():
+    """Old create_ap versions write 'unmanaged-devices=...interface-name:ap0' into NetworkManager.conf
+    and only remove it on a clean exit. Remove leftover ap*/hsm entries after a crash or power-off."""
+    changed = False
+    for path in NM_CONFS:
+        try:
+            lines = open(path).read().splitlines(True)
+        except OSError:
+            continue
+        out, file_changed = [], False
+        for ln in lines:
+            if ln.strip().startswith("unmanaged-devices="):
+                key, _, val = ln.partition("=")
+                items = [i for i in val.strip().split(";") if i]
+                keep = [i for i in items if not re.fullmatch(r"interface-name:(ap\d+|hsm-\S+)", i.strip())]
+                if keep != items:
+                    changed = file_changed = True
+                    if not keep:
+                        continue
+                    ln = f"{key}={';'.join(keep)}\n"
+            out.append(ln)
+        if file_changed:
+            tmp = path + ".hsm-tmp"
+            with open(tmp, "w") as f:
+                f.writelines(out)
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+            os.replace(tmp, path)
+    return changed
+
+
+def boot_guard():
+    """Run at every boot (hotspot-manager-boot.service, before NetworkManager is relied upon)."""
+    os.makedirs(RUN, exist_ok=True)
+    os.chmod(RUN, 0o755)
+    neutralise_foreign_units()
+    for ap in ap_ifaces():
+        run_q(["iw", "dev", ap, "del"])
+    for d in glob.glob("/tmp/create_ap.*"):
+        shutil.rmtree(d, ignore_errors=True)
+    fw_cleanup()
+    shaping_cleanup()
+    nm_changed = strip_stale_unmanaged()
+    write_json(STATUS, {"state": "stopped", "updated": time.time()}, 0o644)
+    cfg = load_conf()
+    if nm_changed:
+        run_q(["nmcli", "general", "reload"], timeout=10)
+    nm_give_back(cfg.get("wifi_iface") or "")
+
+
+# ---------------------------------------------------------------- firewall / shaping
+def ipt(*a):
+    return run_q(["iptables", "-w", *a])
+
+
+CHAINS = (("HSM_IN", "INPUT"), ("HSM_FWD", "FORWARD"))
+GATE = "HSM_GATE"
+
+
+def fw_cleanup():
+    for ch, parent in CHAINS:
+        for line in ipt("-S", parent).stdout.splitlines():
+            if line.endswith(f"-j {ch}"):
+                ipt("-D", *line.split()[1:])
+    for ch in ("HSM_IN", "HSM_FWD", GATE):
+        ipt("-F", ch)
+    for ch in ("HSM_IN", "HSM_FWD", GATE):
+        ipt("-X", ch)
+
+
+def shaping_cleanup(ap=None):
+    if ap:
+        run_q(["tc", "qdisc", "del", "dev", ap, "root"])
+        run_q(["tc", "qdisc", "del", "dev", ap, "ingress"])
+    run_q(["ip", "link", "del", IFB])
+
+
+def dns_hex(domain):
+    return "".join(f"|{len(l):02x}|{l}" for l in domain.split(".")) + "|00|"
+
+
+def tc(*a):
+    return run_q(["tc", *a])
+
+
+def shape(dev, tot, per, ips, key):
+    """HTB on dev: total cap + optional per-IP cap. key = 'dst' (download) or 'src' (upload)."""
+    tc("qdisc", "del", "dev", dev, "root")
+    if not tot and not per:
+        return ""
+    kb = lambda m: f"{max(64, int(m * 1000))}kbit"
+    top = kb(tot) if tot else "2000mbit"
+    leaf = kb(min(per, tot) if tot and per else (per or tot))
+    r = tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "99")
+    if r.returncode:
+        return r.stderr.strip()
+    tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1", "htb", "rate", top, "ceil", top)
+    classes = [("99", None)] + [(str(100 + i), ip) for i, ip in enumerate(ips)]
+    for cid, ip in classes:
+        tc("class", "add", "dev", dev, "parent", "1:1", "classid", f"1:{cid}", "htb",
+           "rate", "64kbit" if per else top, "ceil", leaf if per else top)
+        tc("qdisc", "add", "dev", dev, "parent", f"1:{cid}", "fq_codel")
+        if ip:
+            tc("filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1",
+               "u32", "match", "ip", key, f"{ip}/32", "flowid", f"1:{cid}")
+    return ""
+
+
+class Controls:
+    """Live access control: MAC block, allow-list, max devices, website/IP filter, speed shaping."""
+
+    def __init__(self, ap, note):
+        self.ap, self.note = ap, note
+        self.denied, self.overflow, self.order = set(), set(), []
+        self.unknown = {}
+        self.tc_sig = None
+        self.ifb = False
+        self.warnings = []
+        self.ctrl = None
+        fw_cleanup()
+        shaping_cleanup(ap)
+        ipt("-N", GATE)
+        for ch, parent in CHAINS:
+            ipt("-N", ch)
+            ipt("-I", parent, "1", "-i", ap, "-j", ch)
+
+    def apply_fw(self, cfg):
+        self.warnings = []
+        for ch in ("HSM_IN", "HSM_FWD", GATE):
+            ipt("-F", ch)
+
+        def add(*rule):
+            r = ipt("-A", *rule)
+            if r.returncode:
+                self.warnings.append(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "iptables error")
+        for b in cfg["blocked"]:
+            for ch, _ in CHAINS:
+                add(ch, "-m", "mac", "--mac-source", b["mac"], "-j", "DROP")
+        if cfg["allow_mode"]:
+            for a in cfg["allowed"]:
+                add(GATE, "-m", "mac", "--mac-source", a["mac"], "-j", "RETURN")
+            add(GATE, "-j", "DROP")
+            for ch, _ in CHAINS:
+                add(ch, "-j", GATE)
+        doms = [e for e in cfg["blocklist"] if not is_net(e)]
+        for e in cfg["blocklist"]:
+            if is_net(e):
+                add("HSM_FWD", "-d", e, "-j", "REJECT")
+        for d in doms:
+            hx = dns_hex(d)
+            for ch, _ in CHAINS:
+                for proto in ("udp", "tcp"):
+                    add(ch, "-p", proto, "--dport", "53", "-m", "string", "--algo", "bm", "--icase",
+                        "--hex-string", hx, "-j", "DROP")
+            add("HSM_FWD", "-p", "tcp", "-m", "multiport", "--dports", "80,443", "-m", "string",
+                "--algo", "bm", "--icase", "--string", d, "-j", "REJECT", "--reject-with", "tcp-reset")
+            add("HSM_FWD", "-p", "udp", "--dport", "443", "-m", "string", "--algo", "bm", "--icase",
+                "--string", d, "-j", "DROP")
+        if doms:
+            add("HSM_FWD", "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+        self.warnings = sorted(set(self.warnings))
+        for w in self.warnings:
+            self.note("Filter warning: " + w)
+        self.note(f"Controls applied: {len(cfg['blocked'])} blocked, "
+                  + (f"allow-list ON ({len(cfg['allowed'])} approved), " if cfg["allow_mode"] else "")
+                  + f"{len(cfg['blocklist'])} filter entr{'y' if len(cfg['blocklist']) == 1 else 'ies'}, "
+                  f"max devices {cfg['max_clients'] or 'unlimited'}.")
+
+    def hcli(self, *a):
+        if not self.ctrl or not os.path.exists(self.ctrl):
+            c = [d for d in glob.glob("/tmp/create_ap.*/hostapd_ctrl") if os.path.exists(f"{d}/{self.ap}")]
+            self.ctrl = c[0] if c else None
+        if not self.ctrl:
+            return ""
+        return sh(["hostapd_cli", "-p", self.ctrl, "-i", self.ap, *a])
+
+    def acl(self, op, mac):
+        if "OK" not in self.hcli("deny_acl", op, mac):
+            self.hcli("raw", "DENY_ACL", op, mac)
+
+    def kick(self, mac):
+        if "OK" not in self.hcli("deauthenticate", mac):
+            sh(["iw", "dev", self.ap, "station", "del", mac])
+
+    def enforce(self, cfg, cl, now):
+        conn = [c["mac"] for c in cl]
+        blocked = {b["mac"] for b in cfg["blocked"]}
+        allowed = {a["mac"] for a in cfg["allowed"]}
+        if cfg["allow_mode"]:
+            for m in conn:
+                if m not in allowed and m not in blocked:
+                    if m not in self.unknown:
+                        self.note(f"Allow-list: rejected unknown device {m}.")
+                    self.unknown[m] = now
+        for m in list(self.unknown):
+            if not cfg["allow_mode"] or m in allowed or m in blocked or now - self.unknown[m] > 1800:
+                del self.unknown[m]
+        gate = set(self.unknown)
+        self.order = [m for m in self.order if m in conn] + [m for m in conn if m not in self.order]
+        active = [m for m in self.order if m not in blocked and m not in gate]
+        lim = cfg["max_clients"]
+        if lim and len(active) > lim:
+            new = set(active[lim:])
+            for m in new - self.overflow:
+                self.note(f"Max devices ({lim}) reached: rejected {m}.")
+            self.overflow |= new
+        elif not lim or len(active) < lim:
+            self.overflow.clear()
+        want = blocked | self.overflow | gate
+        for m in want - self.denied:
+            self.acl("ADD_MAC", m)
+        for m in self.denied - want:
+            self.acl("DEL_MAC", m)
+        self.denied = want
+        for m in set(conn) & want:
+            self.kick(m)
+        return [c for c in cl if c["mac"] not in want]
+
+    def apply_tc(self, cfg, cl):
+        dt, dp, ut, up = (float(cfg[k]) for k in ("dl_total", "dl_per", "ul_total", "ul_per"))
+        ips = sorted({c["ip"] for c in cl if c.get("ip")}) if (dp or up) else []
+        sig = (dt, dp, ut, up, tuple(ips))
+        if sig == self.tc_sig:
+            return
+        self.tc_sig = sig
+        err = shape(self.ap, dt, dp, ips if dp else [], "dst")
+        if err:
+            self.note("Download limit failed: " + err)
+        if ut or up:
+            if not self.ifb:
+                run_q(["modprobe", "ifb", "numifbs=0"])
+                run_q(["ip", "link", "add", IFB, "type", "ifb"])
+                run_q(["ip", "link", "set", IFB, "up"])
+                tc("qdisc", "del", "dev", self.ap, "ingress")
+                r1 = tc("qdisc", "add", "dev", self.ap, "handle", "ffff:", "ingress")
+                r2 = tc("filter", "add", "dev", self.ap, "parent", "ffff:", "protocol", "all", "prio", "10",
+                        "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", IFB)
+                if r1.returncode or r2.returncode:
+                    self.note("Upload limit failed: " + (r1.stderr or r2.stderr).strip())
+                    return
+                self.ifb = True
+            err = shape(IFB, ut, up, ips if up else [], "src")
+            if err:
+                self.note("Upload limit failed: " + err)
+        elif self.ifb:
+            tc("qdisc", "del", "dev", self.ap, "ingress")
+            run_q(["ip", "link", "del", IFB])
+            self.ifb = False
+
+
+class Usage:
+    def __init__(self):
+        d = read_json(USAGE, {})
+        if not isinstance(d, dict):
+            d = {}
+        d.setdefault("days", {})
+        d.setdefault("sessions", [])
+        self.d = d
+
+    def add(self, rx, tx, secs, nclients):
+        day = datetime.date.today().isoformat()
+        e = self.d["days"].setdefault(day, {"rx": 0, "tx": 0, "seconds": 0, "peak_clients": 0})
+        e["rx"] += rx
+        e["tx"] += tx
+        e["seconds"] = round(e["seconds"] + secs, 1)
+        e["peak_clients"] = max(e["peak_clients"], nclients)
+
+    def save(self):
+        days = self.d["days"]
+        for k in sorted(days)[:-400]:
+            del days[k]
+        self.d["sessions"] = self.d["sessions"][-300:]
+        os.makedirs(VAR, exist_ok=True)
+        write_json(USAGE, self.d, 0o644)
+
+
+# ---------------------------------------------------------------- supervisor
+def restart_self(**env):
+    for k in ("HSM_MODE", "HSM_RETRY", "HSM_SWITCHED"):
+        os.environ.pop(k, None)
+    os.environ.update({k: str(v) for k, v in env.items()})
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), "run"])
+
+
+def run():
+    os.makedirs(RUN, exist_ok=True)
+    os.chmod(RUN, 0o755)
+    os.makedirs(VAR, exist_ok=True)
+    standalone = os.environ.get("HSM_MODE") == "standalone"
+    retry = int(os.environ.get("HSM_RETRY", "0") or 0)
+    switched = os.environ.get("HSM_SWITCHED") == "1"
+    cfg = load_conf()
+    status = {"state": "starting", "ssid": cfg["ssid"], "wifi_iface": cfg["wifi_iface"],
+              "ap_iface": "", "channel": None, "started_at": None, "error": "", "reason": "",
+              "clients": [], "rx": 0, "tx": 0, "session_rx": 0, "session_tx": 0, "main": {},
+              "idle_left": None, "limited": [], "rejected": [], "warnings": [],
+              "standalone": standalone, "internet": None, "updated": 0}
+    if retry:
+        status["reason"] = f"Recovering after a crash (attempt {retry}/{MAX_RETRY})…"
+
+    def put():
+        status["updated"] = time.time()
+        write_json(STATUS, status, 0o644)
+
+    try:
+        validate(cfg)
+    except ValueError as e:
+        status.update(state="error", error=str(e))
+        put()
+        sys.exit(2)
+    ca = shutil.which("create_ap")
+    if not ca:
+        status.update(state="error", error="create_ap was not found. Install linux-wifi-hotspot.")
+        put()
+        sys.exit(2)
+
+    wifi = cfg["wifi_iface"]
+    inet = cfg["inet_iface"] or wifi
+    log = open(LOG, "a", buffering=1)
+    os.chmod(LOG, 0o644)
+
+    def note(msg):
+        log.write(f"[{time.strftime('%H:%M:%S')}] [manager] {msg}\n")
+
+    neutralise_foreign_units(note)             # never run alongside create_ap.service
+
+    flags = {"stop": False, "rechannel": False, "pause": None}
+    signal.signal(signal.SIGTERM, lambda *a: flags.__setitem__("stop", True))
+    signal.signal(signal.SIGINT, lambda *a: flags.__setitem__("stop", True))
+
+    args = [ca, "-w", "2"]
+    sta = sta_link(wifi)
+    status["main"] = sta
+    if sta["connected"]:
+        standalone = False
+        status["standalone"] = False
+    if sta["connected"] and sta["channel"]:
+        ch = sta["channel"]
+        # Adapter supports only one channel at a time: AP must follow the main Wi-Fi.
+        args += ["-c", str(ch), "--freq-band", "5" if ch > 14 else "2.4"]
+        if cfg["band"] != "auto" and cfg["band"] != ("5" if ch > 14 else "2.4"):
+            note(f"Band '{cfg['band']} GHz' ignored: the AP must share the main Wi-Fi channel {ch}.")
+    else:
+        ch = 36 if cfg["band"] == "5" else 1
+        args += ["-c", str(ch), "--freq-band", "5" if cfg["band"] == "5" else "2.4"]
+    status["channel"] = ch
+    if cfg["hidden"]:
+        args.append("--hidden")
+    if cfg["isolate"]:
+        args.append("--isolate-clients")
+    args += [wifi, inet]                       # same iface -> create_ap uses a virtual AP (ap0)
+    note("Main Wi-Fi: " + (f"{sta['ssid']} (channel {sta['channel']})" if sta["connected"]
+                           else "not connected (hotspot-only mode, no internet)"))
+    note("Starting: " + " ".join(args))
+    put()
+
+    proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True)
+    try:                                       # SSID + passphrase via stdin (not visible in ps)
+        proc.stdin.write(f"{cfg['ssid']}\n{cfg['password']}\n")
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+
+    inet_state = {"ok": None, "stop": False}
+
+    def inet_loop():
+        while not inet_state["stop"]:
+            inet_state["ok"] = internet_ok() if sta_link(wifi)["connected"] else False
+            for _ in range(INET_CHECK):
+                if inet_state["stop"]:
+                    return
+                time.sleep(1)
+    threading.Thread(target=inet_loop, daemon=True).start()
+
+    usage = Usage()
+    sess = {"start": time.time(), "end": None, "rx": 0, "tx": 0, "peak_clients": 0, "ssid": cfg["ssid"]}
+    ap, last, was_up = None, None, False
+    ctl, idle_since, auto_off = None, None, False
+    up_since = None
+    sta_seen = sta["connected"]
+    lost_since = None
+    probe = False
+    try:
+        conf_mtime = os.path.getmtime(CONF)
+    except OSError:
+        conf_mtime = 0
+    t_prev = t_save = t_sta = time.time()
+    t_start = t_probe = time.time()
+    cl = []
+
+    while not flags["stop"] and proc.poll() is None:
+        now = time.time()
+        dt, t_prev = now - t_prev, now
+        if not ap:
+            cands = [i for i in ap_ifaces() if i != wifi]
+            if cands:
+                ap, was_up, up_since = cands[0], True, now
+                status.update(state="running", ap_iface=ap, started_at=now, error="",
+                              reason="Running without internet: main Wi-Fi unavailable." if standalone else "")
+                note(f"Hotspot is up on {ap}, channel {ch}" + (" (hotspot-only)." if standalone else "."))
+                ctl = Controls(ap, note)
+                ctl.apply_fw(cfg)
+                idle_since = now
+        try:
+            m = os.path.getmtime(CONF)
+        except OSError:
+            m = conf_mtime
+        if m != conf_mtime:
+            conf_mtime = m
+            new = load_conf()
+            try:
+                validate(new)
+                fw_changed = any(new[k] != cfg[k] for k in FW_KEYS)
+                cfg.update({k: new[k] for k in LIVE_KEYS})
+                if ctl and fw_changed:
+                    ctl.apply_fw(cfg)
+            except ValueError as e:
+                note(f"Ignored invalid config change: {e}")
+        if ap:
+            cur = counters(ap)
+            if cur is None:
+                ap, last = None, None
+            else:
+                drx = dtx = 0
+                if last:
+                    drx, dtx = cur[0] - last[0], cur[1] - last[1]
+                    if drx < 0 or dtx < 0:
+                        drx = dtx = 0
+                last = cur
+                cl = clients(ap)
+                if ctl:
+                    cl = ctl.enforce(cfg, cl, now)
+                    ctl.apply_tc(cfg, cl)
+                if cl:
+                    idle_since = now
+                left = None
+                if cfg["idle_off"] and idle_since:
+                    left = cfg["idle_off"] * 60 - (now - idle_since)
+                    if left <= 0:
+                        note(f"Auto-off: no devices for {cfg['idle_off']} min.")
+                        auto_off = True
+                        break
+                sess["rx"] += drx
+                sess["tx"] += dtx
+                sess["peak_clients"] = max(sess["peak_clients"], len(cl))
+                usage.add(drx, dtx, dt, len(cl))
+                status.update(rx=cur[0], tx=cur[1], session_rx=sess["rx"], session_tx=sess["tx"], clients=cl,
+                              idle_left=left, limited=sorted(ctl.overflow) if ctl else [],
+                              rejected=[{"mac": k, "t": v} for k, v in
+                                        sorted(ctl.unknown.items(), key=lambda x: -x[1])[:20]] if ctl else [],
+                              warnings=ctl.warnings if ctl else [])
+        status["internet"] = None if standalone else inet_state["ok"]
+
+        # ---- main Wi-Fi watchdog: the radio has one channel, so a locked AP blocks reconnection
+        if now - t_sta >= STA_CHECK:
+            t_sta = now
+            sta = sta_link(wifi)
+            status["main"] = sta
+            if sta["connected"]:
+                lost_since = None
+                if not sta_seen or standalone:
+                    note(f"Main Wi-Fi connected to {sta['ssid']}; restarting hotspot with internet sharing.")
+                    flags["rechannel"] = True
+                    break
+                if ap and sta["channel"] and sta["channel"] != ch and now - t_start > 20:
+                    note(f"Main Wi-Fi moved to channel {sta['channel']}; restarting hotspot on the new channel.")
+                    flags["rechannel"] = True
+                    break
+            elif sta_seen:
+                lost_since = lost_since or now
+                if now - lost_since >= STA_LOST_GRACE:
+                    note("Main Wi-Fi disconnected: pausing hotspot so Wi-Fi can reconnect.")
+                    flags["pause"] = "lost"
+                    break
+            elif ap and 40 <= nm_state(wifi) < 100:
+                note("Wi-Fi connection requested: pausing hotspot so Wi-Fi can connect.")
+                flags["pause"] = "connect"
+                break
+            elif ap and (standalone or not sta_seen) and now - t_probe >= (PROBE_BUSY if cl else PROBE_IDLE):
+                note("Hotspot-only: briefly pausing to look for main Wi-Fi.")
+                flags["pause"] = "connect"
+                probe = True
+                break
+        if up_since and retry and now - up_since > 120:
+            retry = 0
+        put()
+        if now - t_save >= 30:
+            usage.save()
+            t_save = now
+        time.sleep(TICK)
+
+    inet_state["stop"] = True
+    crashed = proc.poll() is not None and not flags["stop"]
+    if crashed and sta_seen and not standalone and not sta_link(wifi)["connected"]:
+        note("Hotspot stopped because main Wi-Fi was lost: waiting for Wi-Fi to reconnect.")
+        flags["pause"] = "lost"
+        crashed = False
+
+    fw_cleanup()
+    shaping_cleanup(ap)
+    if proc.poll() is None:
+        proc.terminate()                       # create_ap traps SIGTERM and cleans up (removes ap0)
+        try:
+            proc.wait(15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    if was_up:
+        sess["end"] = time.time()
+        usage.d["sessions"].append(sess)
+    usage.save()
+
+    status.update(clients=[], ap_iface="", idle_left=None, limited=[], rejected=[], started_at=None)
+    stopping = lambda: flags["stop"]
+
+    if flags["rechannel"] and not flags["stop"]:
+        log.close()
+        time.sleep(2)
+        restart_self()
+
+    if flags["pause"] and not flags["stop"]:
+        nm_give_back(wifi)
+        fb = cfg["fallback_min"]
+        if probe:
+            status.update(state="paused", error="", reason="Checking whether main Wi-Fi is back…")
+        else:
+            status.update(state="paused", error="",
+                          reason="Paused: waiting for main Wi-Fi. The hotspot resumes automatically"
+                          + (f" (without internet after {fb} min)." if fb else "."))
+        put()
+        time.sleep(2)
+        nm_reconnect(wifi)
+        t0 = time.time()
+        limit = PROBE_WAIT if probe else STANDALONE_WAIT
+        while not flags["stop"]:
+            sta = sta_link(wifi)
+            status["main"] = sta
+            put()
+            if sta["connected"]:
+                note(f"Main Wi-Fi connected to {sta['ssid']} (channel {sta['channel']}); resuming hotspot.")
+                time.sleep(3)
+                log.close()
+                restart_self()
+            el = time.time() - t0
+            if flags["pause"] == "connect" and el > limit:
+                note("Wi-Fi did not connect; resuming " + ("hotspot-only mode." if (probe or standalone)
+                                                           else "hotspot."))
+                log.close()
+                restart_self(**({"HSM_MODE": "standalone"} if (probe or standalone) else {}))
+            if flags["pause"] == "lost" and fb and el > fb * 60:
+                note(f"Main Wi-Fi still unavailable after {fb} min; running hotspot without internet.")
+                log.close()
+                restart_self(HSM_MODE="standalone")
+            if flags["pause"] == "lost" and int(el) % 60 < 2 and el > 5:
+                nm_reconnect(wifi)
+            time.sleep(2)
+
+    rc = 0
+    if auto_off:
+        status.update(state="stopped", error="",
+                      reason=f"Turned off automatically: no devices for {cfg['idle_off']} min.")
+    elif flags["stop"]:
+        status.update(state="stopped", error="", reason="")
+        note("Hotspot stopped.")
+    else:
+        try:
+            tail = open(LOG).read()[-6000:]
+        except OSError:
+            tail = ""
+        note(f"create_ap exited with code {proc.returncode}.")
+        if channel_problem(tail) and cfg["pref_net"] and not switched:
+            note(f"Switching main Wi-Fi to preferred network '{cfg['pref_net']}'.")
+            status.update(state="starting", reason=f"Switching main Wi-Fi to {cfg['pref_net']}…")
+            put()
+            r = run_q(["nmcli", "connection", "up", "id", cfg["pref_net"]], timeout=45)
+            if r.returncode == 0 and wait_sta(wifi, 20, stopping):
+                log.close()
+                time.sleep(2)
+                restart_self(HSM_SWITCHED="1")
+            note("Could not switch network: " + (r.stderr.strip() or "timeout"))
+        if retry < MAX_RETRY and not flags["stop"]:
+            wait = 5 * 2 ** retry
+            note(f"Auto-recover: restarting in {wait}s (attempt {retry + 1}/{MAX_RETRY}).")
+            status.update(state="starting", error="",
+                          reason=f"Hotspot crashed; retrying in {wait}s (attempt {retry + 1}/{MAX_RETRY})…")
+            put()
+            t0 = time.time()
+            while time.time() - t0 < wait and not flags["stop"]:
+                time.sleep(1)
+            if not flags["stop"]:
+                log.close()
+                restart_self(HSM_RETRY=retry + 1, **({"HSM_SWITCHED": "1"} if switched else {}))
+        if flags["stop"]:
+            status.update(state="stopped", error="", reason="")
+        else:
+            status.update(state="error", reason="", error=error_hint(tail))
+            rc = 1
+    nm_give_back(wifi)
+    put()
+    log.close()
+    try:
+        if os.path.getsize(LOG) > LOG_MAX:
+            with open(LOG, "rb") as f:
+                f.seek(-LOG_MAX, 2)
+                data = f.read()
+            with open(LOG, "wb") as f:
+                f.write(data)
+    except OSError:
+        pass
+    sys.exit(rc)
+
+
+# ---------------------------------------------------------------- commands
+def systemctl(*a):
+    return subprocess.run(["systemctl", *a], capture_output=True).returncode
+
+
+def main():
+    if os.geteuid() != 0:
+        die("hsctl must run as root.")
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "run":
+        run()
+    elif cmd in ("start", "restart"):
+        try:
+            validate(load_conf())
+        except ValueError as e:
+            die(str(e), 2)
+        systemctl("reset-failed", SERVICE)
+        os.makedirs(RUN, exist_ok=True)
+        os.chmod(RUN, 0o755)
+        st = read_json(STATUS, {})
+        if cmd == "start" or st.get("state") not in ("running", "paused"):
+            write_json(STATUS, {"state": "starting", "updated": time.time()}, 0o644)
+        if cmd == "start":
+            try:
+                open(LOG, "w").close()
+            except OSError:
+                pass
+        sys.exit(systemctl(cmd, "--no-block", SERVICE))
+    elif cmd == "stop":
+        sys.exit(systemctl("stop", "--no-block", SERVICE))
+    elif cmd == "get-config":
+        print(json.dumps(load_conf()))
+    elif cmd == "set-config":
+        try:
+            data = json.loads(sys.stdin.read(65536))
+            c = load_conf()
+            c.update({k: data[k] for k in DEFAULTS if k in data})
+            validate(c)
+        except (ValueError, TypeError, AttributeError) as e:
+            die(str(e), 2)
+        os.makedirs(ETC, mode=0o755, exist_ok=True)
+        write_json(CONF, c, 0o600)
+    elif cmd == "reset-usage":
+        os.makedirs(VAR, exist_ok=True)
+        write_json(USAGE, {"days": {}, "sessions": []}, 0o644)
+    elif cmd == "cleanup":
+        fw_cleanup()
+        shaping_cleanup()
+        st = read_json(STATUS, {})
+        if st.get("state") not in ("stopped", "error"):
+            st.update(state="stopped", clients=[], ap_iface="", updated=time.time())
+            os.makedirs(RUN, exist_ok=True)
+            write_json(STATUS, st, 0o644)
+        nm_give_back(load_conf().get("wifi_iface") or "")
+    elif cmd == "boot":
+        boot_guard()
+    else:
+        die(__doc__, 64)
+
+
+if __name__ == "__main__":
+    main()
